@@ -9,6 +9,8 @@ import sys
 import asyncio
 import aiohttp
 from pathlib import Path
+import time
+import io
 
 # ══════════════════════════════════════════════════
 #                   CONFIGURACIÓN
@@ -38,13 +40,14 @@ PALABRAS = [
     "La reputacion de la CCG es una mierda.",
 ]
 
-PD_ROLE_ID     = 1445639262446817380
-MEMBER_ROLE_ID = 1478506758388584569
-REP_ROLES      = {1445637786081165412, 1445637691042566254, 1445637435638681691}
-MSG_ROLE_ID    = 1445637435638681691
-REP_CHANNEL_ID = 1451799073769263206
-STAFF_ROLE_ID  = 1445638316547510303
-OWNER_ROLE_ID  = 1445637435638681691
+PD_ROLE_ID         = 1445639262446817380
+MEMBER_ROLE_ID     = 1478506758388584569
+VERIFICADO_ROLE_ID = 123456789012345678  # REEMPLAZA CON EL ID REAL DEL ROL VERIFICADO
+REP_ROLES          = {1445637786081165412, 1445637691042566254, 1445637435638681691}
+MSG_ROLE_ID        = 1445637435638681691
+REP_CHANNEL_ID     = 1451799073769263206
+STAFF_ROLE_ID      = 1445638316547510303
+OWNER_ROLE_ID      = 1445637435638681691
 
 INVITE_LINK = "https://discord.gg/EVWsSVsTdG"
 DATA_FILE = "bot_data.json"
@@ -66,7 +69,8 @@ BOT_DATA = {
     "nicknames": {},           
     "active_nicknames": {},    
     "embeds": {},              
-    "state_cache": {} 
+    "state_cache": {},
+    "last_message_cache": {} # Almacena el timestamp del último mensaje de cada usuario
 }
 
 SALARIOS: dict[str, int] = {
@@ -84,7 +88,7 @@ SALARIOS: dict[str, int] = {
     "Senior First Class Investigator":        700_000,
     "Senior Investigator":                    820_000,
     "Associate Special Class Investigator": 1_050_000,
-    "Special Class Investigator":             1_400_000,
+    "Special Class Investigator":           1_400_000,
 }
 
 # ══════════════════════════════════════════════════
@@ -143,7 +147,7 @@ async def actualizar_embed_discord(channel_id: int, message_id: int, nickname: s
         print(f"❌ [Sync Error] Fallo al editar el mensaje de Discord {message_id}: {e}")
 
 # ══════════════════════════════════════════════════
-#                    API WEB
+#                   API WEB
 # ══════════════════════════════════════════════════
 
 async def endpoint_consultar(request: web.Request) -> web.Response:
@@ -298,6 +302,11 @@ async def sync_command(ctx: commands.Context):
 @bot.event
 async def on_message(message: discord.Message):
     if message.author == bot.user: return
+    
+    # RASTREADOR DE ACTIVIDAD
+    if not message.author.bot:
+        BOT_DATA.setdefault("last_message_cache", {})[str(message.author.id)] = message.created_at.timestamp()
+    
     if bot.user.mentioned_in(message) and not message.mention_everyone:
         await message.reply(random.choice(PALABRAS), mention_author=True)
     await bot.process_commands(message)
@@ -305,6 +314,78 @@ async def on_message(message: discord.Message):
 # ══════════════════════════════════════════════════
 #                 COMANDOS SLASHS
 # ══════════════════════════════════════════════════
+
+@bot.tree.command(name="inactivos", description="Quita rol de Miembro y Verificado y te envía reporte por MD")
+async def inactivos_command(interaction: discord.Interaction, id_mensaje: str):
+    roles_usuario = {r.id for r in interaction.user.roles}
+    if STAFF_ROLE_ID not in roles_usuario and OWNER_ROLE_ID not in roles_usuario:
+        await interaction.response.send_message("❌ No tienes permiso.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        mensaje = await interaction.channel.fetch_message(int(id_mensaje.strip()))
+    except discord.NotFound:
+        await interaction.followup.send("❌ Mensaje no encontrado. Úsalo en el canal del Activity Check.")
+        return
+    except ValueError:
+        await interaction.followup.send("❌ ID del mensaje inválido.")
+        return
+
+    usuarios_que_reaccionaron = set()
+    for reaccion in mensaje.reactions:
+        async for usuario in reaccion.users():
+            usuarios_que_reaccionaron.add(usuario.id)
+
+    miembros_modificados = 0
+    reporte_lineas = ["Reporte de Inactividad — CCG/Roleplay", "="*45, ""]
+
+    for miembro in interaction.guild.members:
+        if miembro.bot: continue
+
+        if miembro.id not in usuarios_que_reaccionaron:
+            roles_a_quitar = [rol for rol in miembro.roles if rol.id in (MEMBER_ROLE_ID, VERIFICADO_ROLE_ID)]
+            
+            if roles_a_quitar:
+                try:
+                    await miembro.remove_roles(*roles_a_quitar, reason="Activity Check fallido")
+                    miembros_modificados += 1
+                    
+                    # Cálculo de Fecha de ingreso
+                    ingreso_str = miembro.joined_at.strftime("%d/%m/%Y") if miembro.joined_at else "Desconocido"
+                    
+                    # Cálculo de Último Mensaje
+                    last_msg_ts = BOT_DATA.get("last_message_cache", {}).get(str(miembro.id))
+                    if last_msg_ts:
+                        diferencia = time.time() - last_msg_ts
+                        dias = int(diferencia // 86400)
+                        horas = int((diferencia % 86400) // 3600)
+                        actividad_str = f"Hace {dias} días y {horas} horas"
+                    else:
+                        actividad_str = "No registrado (antes de iniciar el bot)"
+                    
+                    reporte_lineas.append(f"👤 {miembro.name} ({miembro.id})")
+                    reporte_lineas.append(f"   ├─ Se unió: {ingreso_str}")
+                    reporte_lineas.append(f"   └─ Último msg: {actividad_str}")
+                    reporte_lineas.append("")
+                    
+                except discord.Forbidden:
+                    pass
+
+    reporte_texto = "\n".join(reporte_lineas)
+    
+    if miembros_modificados > 0:
+        # Generar un archivo temporal en memoria para el MD
+        archivo = discord.File(io.BytesIO(reporte_texto.encode('utf-8')), filename="reporte_inactivos.txt")
+        try:
+            await interaction.user.send(f"✅ Proceso terminado. Se retiraron roles a **{miembros_modificados}** usuarios. Aquí tienes el reporte detallado:", file=archivo)
+            await interaction.followup.send(f"✅ Se procesaron **{miembros_modificados}** inactivos. Revisa tus mensajes directos para ver el archivo de reporte detallado.")
+        except discord.Forbidden:
+            await interaction.followup.send(f"✅ Se procesaron **{miembros_modificados}** inactivos, pero **no pude enviarte el archivo por MD**. Revisa que tengas los MD abiertos para este servidor.")
+    else:
+        await interaction.followup.send("✅ Todos los miembros con esos roles reaccionaron. No se hicieron cambios.")
+
 
 @bot.tree.command(name="pd", description="Anuncia un Evento PD")
 async def pd_command(interaction: discord.Interaction, hora: str, join: str):
